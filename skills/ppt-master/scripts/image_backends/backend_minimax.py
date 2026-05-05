@@ -4,16 +4,9 @@ MiniMax image generation backend.
 
 Configuration keys:
   MINIMAX_API_KEY   (required)
-  MINIMAX_BASE_URL  (optional)
-  MINIMAX_MODEL     (optional)
+  MINIMAX_BASE_URL  (optional, default: https://api.minimaxi.com)
+  MINIMAX_MODEL     (optional, default: image-01)
 """
-
-import sys
-
-if __name__ == "__main__" and any(arg in {"-h", "--help", "help"} for arg in sys.argv[1:]):
-    print(__doc__)
-    print("Use via: python3 skills/ppt-master/scripts/image_gen.py \"prompt\" --backend minimax")
-    raise SystemExit(0)
 
 import base64
 import os
@@ -26,7 +19,6 @@ from image_backends.backend_common import (
     detect_image_extension,
     http_error,
     is_rate_limit_error,
-    normalize_image_size,
     require_api_key,
     resolve_output_path,
     retry_delay,
@@ -39,57 +31,16 @@ DEFAULT_MODEL = "image-01"
 
 # International fallback: set MINIMAX_BASE_URL=https://api.minimax.io if needed
 
-ASPECT_RATIO_SIZE_MAP = {
-    "512px": {
-        "1:1": (512, 512),
-        "16:9": (640, 360),
-        "4:3": (576, 432),
-        "3:2": (624, 416),
-        "2:3": (416, 624),
-        "3:4": (432, 576),
-        "9:16": (360, 640),
-        "21:9": (672, 288),
-    },
-    "1K": {
-        "1:1": (1024, 1024),
-        "16:9": (1280, 720),
-        "4:3": (1152, 864),
-        "3:2": (1248, 832),
-        "2:3": (832, 1248),
-        "3:4": (864, 1152),
-        "9:16": (720, 1280),
-        "21:9": (1344, 576),
-    },
-    "2K": {
-        "1:1": (2048, 2048),
-        "16:9": (2048, 1152),
-        "4:3": (2048, 1536),
-        "3:2": (2048, 1368),
-        "2:3": (1368, 2048),
-        "3:4": (1536, 2048),
-        "9:16": (1152, 2048),
-        "21:9": (2048, 880),
-    },
-    "4K": {
-        "1:1": (2048, 2048),
-        "16:9": (2048, 1152),
-        "4:3": (2048, 1536),
-        "3:2": (2048, 1368),
-        "2:3": (1368, 2048),
-        "3:4": (1536, 2048),
-        "9:16": (1152, 2048),
-        "21:9": (2048, 880),
-    },
-}
+VALID_ASPECT_RATIOS = {"1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"}
 
 
 def _resolve_url(base_url: str) -> str:
     """Resolve the MiniMax image generation endpoint.
 
     Accepts three forms of MINIMAX_BASE_URL:
-      - Full endpoint:  https://api.minimax.io/v1/image_generation  → used as-is
-      - Versioned base: https://api.minimax.io/v1                   → appends /image_generation
-      - Root base:      https://api.minimax.io                      → appends /v1/image_generation
+      - Full endpoint:  https://api.minimax.io/v1/image_generation  -> used as-is
+      - Versioned base: https://api.minimax.io/v1                   -> appends /image_generation
+      - Root base:      https://api.minimax.io                      -> appends /v1/image_generation
     """
     base = base_url.rstrip("/")
     if base.endswith("/image_generation"):
@@ -99,34 +50,46 @@ def _resolve_url(base_url: str) -> str:
     return base + "/v1/image_generation"
 
 
-def _resolve_dimensions(aspect_ratio: str, image_size: str) -> tuple[int, int]:
-    """Resolve width and height from the unified aspect_ratio/image_size pair."""
-    normalized = normalize_image_size(image_size)
-    dimensions = (ASPECT_RATIO_SIZE_MAP.get(normalized) or {}).get(aspect_ratio)
-    if not dimensions:
-        supported = sorted(ASPECT_RATIO_SIZE_MAP["1K"])
+def _validate_aspect_ratio(aspect_ratio: str) -> str:
+    """Validate and return the aspect ratio, or raise if unsupported."""
+    if aspect_ratio not in VALID_ASPECT_RATIOS:
         raise ValueError(
             f"Unsupported aspect ratio '{aspect_ratio}' for MiniMax backend. "
-            f"Supported: {supported}"
+            f"Supported: {sorted(VALID_ASPECT_RATIOS)}"
         )
-    return dimensions
+    return aspect_ratio
 
 
 def _extract_image_bytes(payload: dict) -> bytes | None:
-    """Extract image bytes from a MiniMax response payload."""
+    """Extract image bytes from a MiniMax response payload.
+
+    The API docs only show the URL response example (data.image_urls).
+    For base64 format, the field name may vary. We try common variants.
+    """
     data = payload.get("data") or {}
-    image_base64 = data.get("image_base64") or []
-    if image_base64:
-        return base64.b64decode(image_base64[0])
+
+    # Try known base64 field names
+    for key in ("image_base64", "base64", "image_data"):
+        values = data.get(key)
+        if values and isinstance(values, list) and values[0]:
+            return base64.b64decode(values[0])
+
+    # Fallback: check if image_urls contain data URIs
+    image_urls = data.get("image_urls") or []
+    if image_urls and image_urls[0].startswith("data:"):
+        _, encoded = image_urls[0].split(",", 1)
+        return base64.b64decode(encoded)
+
     return None
 
 
 def _generate_image(api_key: str, prompt: str,
-                    aspect_ratio: str = "1:1", image_size: str = "1K",
+                    aspect_ratio: str = "1:1",
                     output_dir: str = None, filename: str = None,
-                    model: str = DEFAULT_MODEL, base_url: str = DEFAULT_ENDPOINT) -> str:
+                    model: str = DEFAULT_MODEL,
+                    base_url: str = DEFAULT_ENDPOINT) -> str:
     """Generate one image with the MiniMax backend."""
-    width, height = _resolve_dimensions(aspect_ratio, image_size)
+    _validate_aspect_ratio(aspect_ratio)
     url = _resolve_url(base_url)
 
     headers = {
@@ -136,17 +99,16 @@ def _generate_image(api_key: str, prompt: str,
     payload = {
         "model": model,
         "prompt": prompt,
-        "width": width,
-        "height": height,
+        "aspect_ratio": aspect_ratio,
         "response_format": "base64",
         "n": 1,
+        "prompt_optimizer": True,
     }
 
     print("[MiniMax Image]")
     print(f"  Model:        {model}")
     print(f"  Prompt:       {prompt[:120]}{'...' if len(prompt) > 120 else ''}")
     print(f"  Aspect Ratio: {aspect_ratio}")
-    print(f"  Resolution:   {width}x{height} (from image_size={image_size})")
     print()
     print("  [..] Generating...", end="", flush=True)
     start = time.time()
@@ -164,14 +126,17 @@ def _generate_image(api_key: str, prompt: str,
 
     image_bytes = _extract_image_bytes(data)
     if not image_bytes:
-        raise RuntimeError(f"MiniMax response missing image data: {data}")
+        raise RuntimeError(
+            f"MiniMax response missing image data. "
+            f"Response keys: {list(data.keys())}. Full response: {data}"
+        )
 
     ext = detect_image_extension(image_bytes) or ".jpeg"
     path = resolve_output_path(prompt, output_dir, filename, ext)
     return save_image_bytes(image_bytes, path)
 
 
-def generate(prompt: str,
+def generate(prompt: str, negative_prompt: str = None,
              aspect_ratio: str = "1:1", image_size: str = "1K",
              output_dir: str = None, filename: str = None,
              model: str = None, max_retries: int = MAX_RETRIES) -> str:
@@ -182,16 +147,18 @@ def generate(prompt: str,
     )
     base_url = os.environ.get("MINIMAX_BASE_URL") or DEFAULT_ENDPOINT
     resolved_model = model or os.environ.get("MINIMAX_MODEL") or DEFAULT_MODEL
-    normalized_size = normalize_image_size(image_size)
+
+    final_prompt = prompt
+    if negative_prompt:
+        final_prompt += f"\n\nAvoid the following: {negative_prompt}"
 
     last_error = None
     for attempt in range(max_retries + 1):
         try:
             return _generate_image(
                 api_key=api_key,
-                prompt=prompt,
+                prompt=final_prompt,
                 aspect_ratio=aspect_ratio,
-                image_size=normalized_size,
                 output_dir=output_dir,
                 filename=filename,
                 model=resolved_model,
